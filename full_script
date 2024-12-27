@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+Final End-to-End Code for Multi-Timeframe Strategy:
+ - DB + Binance data
+ - 1W,1D,4H,1H environment alignment (shown in dashboard)
+ - 15m for actual entries + exits (not shown in dashboard)
+ - refOpen from actual swing logic => 2 x distance stop
+ - Position sizing for FTMO (contract size=1 for BTC)
+ - Exits on next 15m flip or environment break
+ - Discord notifications ONLY on 1W,1D,4H,1H alignment
+ - Max 4 trades/day, 5% daily dd, 10% overall dd
+ - Trade "history" table in DB, displayed in dashboard
+
+Everything is in ONE file for clarity.
+"""
+
+import os
+import math
+import logging
+import requests
+import ccxt
+import MetaTrader5 as mt5
+import sqlite3
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine, text
+
+import dash
+from dash import Dash, html, dcc
+import dash_bootstrap_components as dbc
+from dash.dependencies import Input, Output
+
+#################################################
+# ----------------- SETTINGS --------------------
+#################################################
+DB_NAME = "market_data.db"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/PLACEHOLDER"  # Replace
+MAX_DAILY_DD_PERCENT = 5.0
+MAX_OVERALL_DD_PERCENT = 10.0
+MAX_TRADES_PER_DAY = 4
+RISK_PERCENT = 1.0       # 1% risk
+SYMBOL = "BTC/USDT"      # For FTMO's MT5, rename to "BTCUSD" if needed
+
+# 1-lot => $1 per $1 move for BTC on FTMO.
+# If you needed e.g. 10 contract size for DOT, you'd incorporate that in position sizing.
+
+HIGHER_TFS = ["1w","1d","4h","1h"]  # shown in dashboard
+LOWER_TF  = "15m"                   # used for actual entries/exits internally
+TIMEFRAMES = HIGHER_TFS + [LOWER_TF]
+TIMEFRAME_LIMIT = {"1w":1000,"1d":1000,"4h":1000,"1h":1000,"15m":1000}
+
+COINS = [SYMBOL]  # We only trade 1 symbol but can expand
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+
+#################################################
+# ------------- (A) DB SETUP --------------------
+#################################################
+def init_db():
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    create_ohlcv_sql = """
+    CREATE TABLE IF NOT EXISTS ohlcv (
+        symbol TEXT,
+        timeframe TEXT,
+        timestamp INTEGER,
+        open REAL,
+        high REAL,
+        low REAL,
+        close REAL,
+        volume REAL,
+        UNIQUE(symbol, timeframe, timestamp) ON CONFLICT IGNORE
+    );
+    """
+    create_trades_sql = """
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        side TEXT,
+        volume REAL,
+        entry_price REAL,
+        stop_loss REAL,
+        ref_open REAL,
+        open_time TEXT,
+        exit_price REAL,
+        close_time TEXT,
+        result REAL
+    );
+    """
+    with engine.connect() as conn:
+        conn.execute(text(create_ohlcv_sql))
+        conn.execute(text(create_trades_sql))
+
+def insert_ohlcv_rows(rows):
+    if not rows:
+        return
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    with engine.begin() as conn:
+        for r in rows:
+            conn.execute(text("""
+                INSERT OR IGNORE INTO ohlcv 
+                (symbol, timeframe, timestamp, open, high, low, close, volume)
+                VALUES (:symbol, :tf, :ts, :o, :h, :l, :c, :v)
+            """), {
+                "symbol": r[0],
+                "tf":      r[1],
+                "ts":      r[2],
+                "o":       r[3],
+                "h":       r[4],
+                "l":       r[5],
+                "c":       r[6],
+                "v":       r[7],
+            })
+
+def fetch_ohlcv_from_db(symbol, timeframe):
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    with engine.begin() as conn:
+        rows=conn.execute(text(f"""
+            SELECT timestamp, open, high, low, close, volume
+            FROM ohlcv
+            WHERE symbol=:symbol AND timeframe=:tf
+            ORDER BY timestamp ASC
+        """), {"symbol":symbol,"tf":timeframe}).fetchall()
+    return list(rows)
+
+def insert_trade(symbol, side, volume, entry_price, stop_loss, ref_open):
+    """Add a trade record to 'trades' table when we open a position."""
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    now_str=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO trades (symbol, side, volume, entry_price, stop_loss, ref_open, open_time)
+            VALUES (:sym, :side, :vol, :ep, :sl, :ro, :ot)
+        """), {
+            "sym":symbol,
+            "side":side,
+            "vol":volume,
+            "ep":entry_price,
+            "sl":stop_loss,
+            "ro":ref_open,
+            "ot":now_str
+        })
+
+def close_trade(symbol, side, exit_price, result):
+    """Close the last open trade for this symbol+side if it exists."""
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    now_str=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    with engine.begin() as conn:
+        # find last opened trade with no close_time
+        row=conn.execute(text("""
+            SELECT id,entry_price
+            FROM trades
+            WHERE symbol=:s AND side=:sd AND close_time IS NULL
+            ORDER BY id DESC LIMIT 1
+        """), {"s":symbol,"sd":side}).fetchone()
+        if row:
+            tid=row[0]
+            #calc result? we do side check
+            ep=row[1]
+            if side=="BUY":
+                trade_res=(exit_price-ep)*100.0  # or some multiple if you want $ instead
+            else:
+                trade_res=(ep-exit_price)*100.0
+            # you can refine how result is computed
+            final_res=round(trade_res,2)
+            conn.execute(text("""
+                UPDATE trades
+                SET exit_price=:xp, close_time=:ct, result=:r
+                WHERE id=:tid
+            """),{"xp":exit_price,"ct":now_str,"r":final_res,"tid":tid})
+
+#################################################
+# ------------- (B) BINANCE FETCH --------------
+#################################################
+import ccxt
+exchange=ccxt.binance({"enableRateLimit":True,"options":{"defaultType":"spot"}})
+
+def get_latest_timestamp(symbol, timeframe):
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    with engine.begin() as conn:
+        row=conn.execute(text("""
+            SELECT MAX(timestamp)
+            FROM ohlcv
+            WHERE symbol=:symbol AND timeframe=:tf
+        """),{"symbol":symbol,"tf":timeframe}).fetchone()
+        return row[0] if row and row[0] else None
+
+def fetch_and_store(symbol, timeframe):
+    limit=TIMEFRAME_LIMIT.get(timeframe,500)
+    logging.info(f"Fetching {symbol},{timeframe}, limit={limit}")
+    last_ts=get_latest_timestamp(symbol,timeframe)
+    if last_ts is None:
+        ohlcv=exchange.fetch_ohlcv(symbol,timeframe,limit=limit)
+    else:
+        since_ms=last_ts+1
+        ohlcv=exchange.fetch_ohlcv(symbol,timeframe,since=since_ms,limit=limit)
+    if not ohlcv:
+        logging.info(f"No new data => {symbol}-{timeframe}")
+        return
+    if len(ohlcv)>0:
+        ohlcv=ohlcv[:-1]
+    rows=[]
+    for (ts,o,h,l,c,v) in ohlcv:
+        rows.append((symbol,timeframe,ts,o,h,l,c,v))
+    insert_ohlcv_rows(rows)
+    logging.info(f"Inserted {len(rows)} new rows => {symbol}-{timeframe}")
+
+def fetch_all_timeframes(sym):
+    for tf in TIMEFRAMES:
+        fetch_and_store(sym, tf)
+
+#################################################
+# ------- (C) REFOPEN CLASSIFY SWING -----------
+#################################################
+def find_ref_open_after_down(ohlcv,i):
+    new_ref_open=ohlcv[i][1]
+    count=1
+    while i-count>=0:
+        _,ob,_,_,cb,_=ohlcv[i-count]
+        if cb<ob:
+            nxt=(i-count)+1
+            if nxt<len(ohlcv):
+                new_ref_open=ohlcv[nxt][1]
+            break
+        count+=1
+    return new_ref_open
+
+def find_ref_open_after_up(ohlcv,i):
+    new_ref_open=ohlcv[i][1]
+    count=1
+    while i-count>=0:
+        _,ob,_,_,cb,_=ohlcv[i-count]
+        if cb>ob:
+            nxt=(i-count)+1
+            if nxt<len(ohlcv):
+                new_ref_open=ohlcv[nxt][1]
+            break
+        count+=1
+    return new_ref_open
+
+def classify_final_direction_with_ref(ohlcv):
+    if not ohlcv:
+        return (None,None)
+    first_ts,f_open,_,_,f_close,_=ohlcv[0]
+    direction="Up" if (f_close>f_open) else "Down"
+    swing_pending=True
+    refOpen=f_open
+    refClose=None
+
+    for i in range(1,len(ohlcv)):
+        ts,c_open,_,_,c_close,_=ohlcv[i]
+        if direction=="Up":
+            if c_close>c_open and swing_pending:
+                continue
+            elif (c_close<c_open) and swing_pending and (c_close>refOpen):
+                _,_,_,_,pc_close,_=ohlcv[i-1]
+                refClose=pc_close
+                swing_pending=False
+            elif c_close<refOpen:
+                direction="Down"
+                swing_pending=True
+                refOpen=find_ref_open_after_up(ohlcv,i)
+                refClose=None
+            elif refClose is not None and (c_close>refClose) and (not swing_pending):
+                direction="Up"
+                swing_pending=True
+                refOpen=find_ref_open_after_down(ohlcv,i)
+                refClose=None
+        else:
+            if (c_close<c_open) and swing_pending:
+                continue
+            elif (c_close>c_open) and swing_pending and (c_close<refOpen):
+                _,_,_,_,pc_close,_=ohlcv[i-1]
+                refClose=pc_close
+                swing_pending=False
+            elif c_close>refOpen:
+                direction="Up"
+                swing_pending=True
+                refOpen=find_ref_open_after_down(ohlcv,i)
+                refClose=None
+            elif refClose is not None and (c_close<refClose) and (not swing_pending):
+                direction="Down"
+                swing_pending=True
+                refOpen=find_ref_open_after_up(ohlcv,i)
+                refClose=None
+    return (direction,refOpen)
+
+def last_candle_time(rows):
+    if not rows:
+        return "No Data"
+    ts=rows[-1][0]
+    return datetime.utcfromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M")
+
+#################################################
+# --------- (D) FTMO TRADING & LOGIC -----------
+#################################################
+daily_trades_count=0
+daily_trades_date=None
+
+def discord_notify(msg):
+    try:
+        requests.post(DISCORD_WEBHOOK_URL,json={"content":msg},timeout=5)
+    except Exception as ex:
+        logging.warning(f"Discord notify fail => {ex}")
+
+def check_ftmo_drawdown():
+    acc=mt5.account_info()
+    if not acc:
+        return False
+    balance=acc.balance
+    equity =acc.equity
+    # daily + overall dd
+    day_dd=balance*(MAX_DAILY_DD_PERCENT/100.0)
+    over_dd=balance*(MAX_OVERALL_DD_PERCENT/100.0)
+    if equity<(balance-day_dd):
+        logging.info(f"Daily dd => skip trades. eq={equity}, limit={(balance-day_dd)}")
+        return False
+    if equity<(balance-over_dd):
+        logging.info(f"Overall dd => skip trades. eq={equity}, limit={(balance-over_dd)}")
+        return False
+    return True
+
+def check_trades_per_day():
+    global daily_trades_count,daily_trades_date
+    today_str=datetime.utcnow().strftime("%Y-%m-%d")
+    if daily_trades_date!=today_str:
+        daily_trades_count=0
+        daily_trades_date=today_str
+    if daily_trades_count>=MAX_TRADES_PER_DAY:
+        logging.info(f"Max trades {MAX_TRADES_PER_DAY} => skip.")
+        return False
+    return True
+
+def get_net_position_side(symbol):
+    """Check actual net position in mt5."""
+    poss=mt5.positions_get(symbol=symbol)
+    if not poss:
+        return None
+    net_buy=0
+    net_sell=0
+    for p in poss:
+        if p.type==mt5.POSITION_TYPE_BUY:
+            net_buy+=p.volume
+        else:
+            net_sell+=p.volume
+    if net_buy>net_sell:
+        return "BUY"
+    elif net_sell>net_buy:
+        return "SELL"
+    return None
+
+def close_position(symbol, side):
+    """Close the entire net position in the opposite direction, 
+       then record in trades table."""
+    poss=mt5.positions_get(symbol=symbol)
+    if not poss:
+        return
+    net_vol=0
+    tick=mt5.symbol_info_tick(symbol)
+    if side=="BUY":
+        # to close => SELL
+        for p in poss:
+            if p.type==mt5.POSITION_TYPE_BUY:
+                net_vol+=p.volume
+        if net_vol>0:
+            req={
+                "action":mt5.TRADE_ACTION_DEAL,
+                "symbol":symbol,
+                "volume":round(net_vol,2),
+                "type":mt5.ORDER_TYPE_SELL,
+                "price":tick.bid if tick else 0,
+                "deviation":10,
+                "magic":123456,
+                "comment":"Close BUY"
+            }
+            result=mt5.order_send(req)
+            if result.retcode==mt5.TRADE_RETCODE_DONE:
+                logging.info(f"[EXIT] closed BUY {symbol}, vol={net_vol}")
+                # record in DB
+                close_trade(symbol,"BUY", (tick.bid if tick else 0), 0)  # result=0 or you can calc precisely
+    else:
+        # side==SELL => to close => BUY
+        for p in poss:
+            if p.type==mt5.POSITION_TYPE_SELL:
+                net_vol+=p.volume
+        if net_vol>0:
+            req={
+                "action":mt5.TRADE_ACTION_DEAL,
+                "symbol":symbol,
+                "volume":round(net_vol,2),
+                "type":mt5.ORDER_TYPE_BUY,
+                "price":tick.ask if tick else 0,
+                "deviation":10,
+                "magic":123456,
+                "comment":"Close SELL"
+            }
+            result=mt5.order_send(req)
+            if result.retcode==mt5.TRADE_RETCODE_DONE:
+                logging.info(f"[EXIT] closed SELL {symbol}, vol={net_vol}")
+                close_trade(symbol,"SELL",(tick.ask if tick else 0),0)
+
+def place_refopen_trade(symbol, side, entry_price, ref_open):
+    """Stop = 2 * abs(entry_price - ref_open).
+       Risk => RISK_PERCENT of balance => volume.
+    """
+    if not check_ftmo_drawdown():
+        logging.info("DD limit => skip trade.")
+        return
+    if not check_trades_per_day():
+        return
+
+    tick=mt5.symbol_info_tick(symbol)
+    if not tick:
+        logging.info("No tick => skip trade.")
+        return
+    dist=2.0*abs(entry_price-ref_open)
+    acc=mt5.account_info()
+    if not acc:
+        logging.info("No account_info => skip.")
+        return
+    balance=acc.balance
+    risk_amount=(RISK_PERCENT/100.0)*balance
+    # since contract size=1 => 1 lot => $1 per $1 move
+    # volume = risk_amount/dist
+    volume=risk_amount/dist
+    volume=max(0.01, round(volume,2))
+
+    if side=="BUY":
+        price=tick.ask
+        sl=entry_price-dist
+        order_type=mt5.ORDER_TYPE_BUY
+    else:
+        price=tick.bid
+        sl=entry_price+dist
+        order_type=mt5.ORDER_TYPE_SELL
+
+    request={
+        "action":mt5.TRADE_ACTION_DEAL,
+        "symbol":symbol,
+        "volume":volume,
+        "type":order_type,
+        "price":price,
+        "sl":sl,
+        "deviation":10,
+        "magic":123456,
+        "comment":"refOpen x2 stop"
+    }
+    result=mt5.order_send(request)
+    if result.retcode!=mt5.TRADE_RETCODE_DONE:
+        logging.info(f"Order fail => {result.retcode},{result.comment}")
+    else:
+        logging.info(f"[ORDER] {side} {symbol} vol={volume}, SL={sl}")
+        # increment daily trades
+        global daily_trades_count
+        daily_trades_count+=1
+        # insert trade
+        insert_trade(symbol,side,volume,entry_price,sl,ref_open)
+
+##################################################
+# --------- (E) STRATEGY: 15m flips ------------
+##################################################
+prev_15m_dirs={}
+def environment_dir(tf_map):
+    # if 1w,1d,4h,1h all=Up => Up, all=Down => Down
+    envs=[tf_map[tf]["direction"] for tf in HIGHER_TFS if tf in tf_map]
+    if len(envs)<4 or any(e is None for e in envs):
+        return None
+    if all(d=="Up" for d in envs):
+        return "Up"
+    elif all(d=="Down" for d in envs):
+        return "Down"
+    return None
+
+def _get_last_close(symbol, timeframe):
+    rows=fetch_ohlcv_from_db(symbol, timeframe)
+    if not rows:
+        return None
+    return rows[-1][4]  # close index
+
+def process_entries(classification_data):
+    """
+    1) Show only 1W,1D,4H,1H in dashboard
+    2) 15m used internally for flips => wait for "counter->in-trend"
+    3) exit on next flip or env break
+    4) Discord notify only if env all Up/Down
+    """
+    # We only do for 1 coin => 'BTC/USDT'
+    if SYMBOL not in classification_data:
+        return
+    # build tf_map => { "1w":{"direction","refOpen"}, "1d":..., "4h":..., "1h":..., "15m":... }
+    tf_map={}
+    for tf in TIMEFRAMES:
+        dir_   = classification_data[SYMBOL][tf]["direction"]
+        ref_op = classification_data[SYMBOL][tf]["refOpen"]
+        tf_map[tf]={"direction":dir_, "refOpen":ref_op}
+
+    env=environment_dir(tf_map)
+    dir_15m = tf_map[LOWER_TF]["direction"]
+    ref_15m = tf_map[LOWER_TF]["refOpen"]
+
+    # If environment is Up or Down => notify once
+    if env in ["Up","Down"]:
+        discord_notify(f"{SYMBOL} environment => ALL {env} (1W,1D,4H,1H)")
+
+    if not env or not dir_15m:
+        # env not aligned => close position if any
+        net_side=get_net_position_side(SYMBOL)
+        if net_side:
+            logging.info(f"[EXIT] environment broke => closing {net_side}")
+            close_position(SYMBOL, net_side)
+        return
+
+    net_side=get_net_position_side(SYMBOL)
+    # If net_side conflicts with env => exit
+    if net_side=="BUY" and env=="Down":
+        logging.info("[EXIT] We have BUY but env=Down => close.")
+        close_position(SYMBOL,"BUY")
+        net_side=None
+    elif net_side=="SELL" and env=="Up":
+        logging.info("[EXIT] We have SELL but env=Up => close.")
+        close_position(SYMBOL,"SELL")
+        net_side=None
+
+    # 15m flip approach
+    prev_15=prev_15m_dirs.get(SYMBOL)
+    if prev_15 is None:
+        prev_15m_dirs[SYMBOL]=dir_15m
+        return
+
+    # exit on next 15m flip => if net_side=BUY and 15m flips Up->Down => exit
+    if net_side=="BUY" and prev_15=="Up" and dir_15m=="Down":
+        logging.info("[EXIT] 15m flipped => close BUY.")
+        close_position(SYMBOL,"BUY")
+        net_side=None
+    elif net_side=="SELL" and prev_15=="Down" and dir_15m=="Up":
+        logging.info("[EXIT] 15m flipped => close SELL.")
+        close_position(SYMBOL,"SELL")
+        net_side=None
+
+    # if no position => look for "counter->in-trend" flip
+    if net_side is None:
+        # env=Up => wait for Down->Up
+        if env=="Up" and prev_15=="Down" and dir_15m=="Up":
+            # place BUY
+            last_close=_get_last_close(SYMBOL,LOWER_TF)
+            if last_close and ref_15m:
+                place_refopen_trade(SYMBOL,"BUY",last_close,ref_15m)
+        elif env=="Down" and prev_15=="Up" and dir_15m=="Down":
+            last_close=_get_last_close(SYMBOL,LOWER_TF)
+            if last_close and ref_15m:
+                place_refopen_trade(SYMBOL,"SELL",last_close,ref_15m)
+
+    prev_15m_dirs[SYMBOL]=dir_15m
+
+##################################################
+# --------- (F) DASHBOARD (no 15m shown) --------
+##################################################
+def color_for_state(state):
+    if state=="Up": return "bg-success text-white"
+    if state=="Down": return "bg-danger text-white"
+    return "bg-secondary text-white"
+
+def build_dashboard_layout(class_data):
+    """
+    We only display 1W,1D,4H,1H in the table (no 15m).
+    Also display a "trade history" from 'trades' table.
+    """
+    rows=[]
+    header=dbc.Row([
+        dbc.Col(html.B("Symbol"),width=2),
+        dbc.Col(html.B("1W"),width=2),
+        dbc.Col(html.B("1D"),width=2),
+        dbc.Col(html.B("4H"),width=2),
+        dbc.Col(html.B("1H"),width=2),
+    ], className="bg-dark text-white p-2")
+    rows.append(header)
+
+    def cell_content(direction, time_str):
+        return dbc.Col([
+            html.Div(direction),
+            html.Small(time_str, className="fst-italic text-muted ms-1"),
+        ], width=2, className=color_for_state(direction))
+
+    for sym in class_data:
+        dir_1w = class_data[sym]["1w"]["direction"]
+        tm_1w  = class_data[sym].get("1w_time","N/A")
+        dir_1d = class_data[sym]["1d"]["direction"]
+        tm_1d  = class_data[sym].get("1d_time","N/A")
+        dir_4h = class_data[sym]["4h"]["direction"]
+        tm_4h  = class_data[sym].get("4h_time","N/A")
+        dir_1h = class_data[sym]["1h"]["direction"]
+        tm_1h  = class_data[sym].get("1h_time","N/A")
+
+        row=dbc.Row([
+            dbc.Col(sym,width=2),
+            cell_content(dir_1w,tm_1w),
+            cell_content(dir_1d,tm_1d),
+            cell_content(dir_4h,tm_4h),
+            cell_content(dir_1h,tm_1h),
+        ], className="p-1")
+        rows.append(row)
+
+    # Now show trade history
+    trades_section = show_trade_history()
+    rows.append(dbc.Row(dbc.Col(html.H4("Trade History"),width=12),className="mt-3"))
+    rows.append(dbc.Row(dbc.Col(trades_section,width=12),className="mb-3"))
+
+    return dbc.Container(rows,fluid=True)
+
+def show_trade_history():
+    """
+    Build a small table from 'trades' table in DB.
+    Columns: side, volume, entry_price, stop_loss, ref_open, open_time, exit_price, close_time, result
+    """
+    engine = create_engine(f"sqlite:///{DB_NAME}")
+    rows=[]
+    with engine.begin() as conn:
+        r=conn.execute(text("SELECT symbol,side,volume,entry_price,stop_loss,ref_open,open_time,exit_price,close_time,result FROM trades ORDER BY id DESC LIMIT 20")).fetchall()
+        rows=list(r)
+
+    table_header = [
+        html.Thead(html.Tr([
+            html.Th("Symbol"),html.Th("Side"),html.Th("Volume"),html.Th("Entry"),html.Th("Stop"),html.Th("RefOpen"),
+            html.Th("OpenTime"),html.Th("ExitPrice"),html.Th("CloseTime"),html.Th("Result")
+        ]))
+    ]
+    table_body=[]
+    body_rows=[]
+    for row in rows:
+        body_rows.append(html.Tr([
+            html.Td(str(row[0])),
+            html.Td(str(row[1])),
+            html.Td(str(row[2])),
+            html.Td(str(row[3])),
+            html.Td(str(row[4])),
+            html.Td(str(row[5])),
+            html.Td(str(row[6])),
+            html.Td(str(row[7]) if row[7] else ""),
+            html.Td(str(row[8]) if row[8] else ""),
+            html.Td(str(row[9]) if row[9] else ""),
+        ]))
+    table_body=html.Tbody(body_rows)
+
+    return dbc.Table(table_header + [table_body], bordered=True, hover=True, responsive=True)
+
+##################################################
+# ------------- (G) MAIN APP RUN ---------------
+##################################################
+classification_data={}
+
+def update_data_and_classifications():
+    for c in COINS:
+        fetch_all_timeframes(c)
+
+    global classification_data
+    classification_data={}
+    for c in COINS:
+        classification_data[c]={}
+        for tf in HIGHER_TFS+ [LOWER_TF]:
+            rows=fetch_ohlcv_from_db(c, tf)
+            d, rO = classify_final_direction_with_ref(rows)
+            classification_data[c][tf]={"direction":d, "refOpen":rO}
+            # also store time
+            if rows:
+                t=rows[-1][0]
+                time_str=datetime.utcfromtimestamp(t/1000).strftime("%Y-%m-%d %H:%M")
+            else:
+                time_str="No Data"
+            classification_data[c][f"{tf}_time"]=time_str
+
+def create_dashboard_app():
+    app=Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+    app.layout=html.Div([
+        html.H3("Multi-Timeframe Dashboard (No 15m shown)", className="text-center my-2"),
+        html.Div(id="dashboard-content"),
+        dcc.Interval(id="refresh-interval", interval=15*60*1000, n_intervals=0)
+    ])
+    return app
+
+def main():
+    init_db()
+    # connect to MT5
+    mt5_login=1234567
+    mt5_password="YOURPASS"
+    mt5_server ="FTMO-Demo"
+    if not mt5.initialize():
+        logging.error("MT5 init fail")
+        return
+    if not mt5.login(login=mt5_login,password=mt5_password,server=mt5_server):
+        logging.error(f"MT5 login fail => {mt5.last_error()}")
+        return
+    logging.info("MT5 logged in => OK")
+
+    app=create_dashboard_app()
+
+    @app.callback(
+        Output("dashboard-content","children"),
+        [Input("refresh-interval","n_intervals")]
+    )
+    def on_refresh(_):
+        update_data_and_classifications()
+        process_entries(classification_data)  # run strategy
+        return build_dashboard_layout(classification_data)
+
+    app.run_server(debug=False, host="0.0.0.0", port=8050)
+
+if __name__=="__main__":
+    main()
